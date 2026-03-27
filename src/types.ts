@@ -133,3 +133,7 @@ export interface JWTPayload {
   email: string;
   tier: string;
 }
+
+// API versions
+export const API_VERSIONS = ['2026-03-28'] as const;
+export const CURRENT_API_VERSION = '2026-03-28';

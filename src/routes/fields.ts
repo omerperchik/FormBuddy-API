@@ -3,11 +3,16 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { query } from '../db/pool.js';
-import { authMiddleware, requireTier } from '../middleware/auth.js';
+import { authMiddleware } from '../middleware/auth.js';
+import { rateLimit } from '../middleware/rate-limit.js';
+import { audit, auditContext } from '../services/audit.js';
 import { FIELD_TYPES, type ClassifyResult, type FormFieldInput } from '../types.js';
 
 const fields = new Hono();
 fields.use('*', authMiddleware);
+
+// AI classification is expensive — strict rate limit
+fields.use('/classify', rateLimit(20, 60_000));
 
 const classifySchema = z.object({
   fields: z.array(z.object({
@@ -16,8 +21,8 @@ const classifySchema = z.object({
     type: z.string().optional(),
     placeholder: z.string().optional(),
     autocomplete: z.string().optional(),
-  })),
-  form_url: z.string().optional(),
+  })).min(1).max(200),
+  form_url: z.string().max(2000).optional(),
 });
 
 const matchSchema = z.object({
@@ -25,7 +30,7 @@ const matchSchema = z.object({
   fields: z.array(z.object({
     name: z.string(),
     classified_type: z.string(),
-  })),
+  })).min(1).max(200),
 });
 
 function hashFormStructure(fields: FormFieldInput[]): string {
@@ -33,27 +38,40 @@ function hashFormStructure(fields: FormFieldInput[]): string {
     .map((f) => `${f.name}|${f.label || ''}|${f.type || ''}`)
     .sort()
     .join('\n');
-  return crypto.createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+  return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
-// POST /api/fields/classify — AI-powered field classification
+// POST /api/fields/classify
 fields.post('/classify', async (c) => {
   const body = await c.req.json();
   const parsed = classifySchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ error: 'Validation failed', details: parsed.error.flatten() }, 400);
+    return c.json({
+      error: {
+        type: 'invalid_request_error',
+        code: 'validation_error',
+        message: 'Invalid request parameters.',
+        details: parsed.error.flatten(),
+      },
+    }, 400);
   }
 
   const { fields: formFields, form_url } = parsed.data;
   const formHash = hashFormStructure(formFields);
 
-  // Check cache first
+  // Check cache
   const cached = await query(
     'SELECT field_name, classified_type, confidence FROM field_classification_cache WHERE form_hash = $1',
     [formHash]
   );
 
-  if (cached.rows.length === formFields.length) {
+  if (cached.rows.length >= formFields.length) {
+    // Update hit counts
+    query(
+      'UPDATE field_classification_cache SET hit_count = hit_count + 1 WHERE form_hash = $1',
+      [formHash]
+    ).catch(() => {});
+
     const results: ClassifyResult[] = formFields.map((f) => {
       const hit = cached.rows.find((r) => r.field_name === f.name);
       return {
@@ -62,7 +80,13 @@ fields.post('/classify', async (c) => {
         confidence: hit?.confidence || 0,
       };
     });
-    return c.json({ results, cached: true });
+
+    return c.json({
+      object: 'classification_result',
+      results,
+      cached: true,
+      form_hash: formHash,
+    });
   }
 
   // Classify with Claude
@@ -80,7 +104,7 @@ fields.post('/classify', async (c) => {
 
   const response = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 1024,
+    max_tokens: 2048,
     messages: [{
       role: 'user',
       content: `Classify each HTML form field into one of these types: ${FIELD_TYPES.join(', ')}
@@ -97,14 +121,21 @@ Return ONLY the JSON array, no other text.`,
   let results: ClassifyResult[] = [];
   try {
     const text = response.content[0].type === 'text' ? response.content[0].text : '';
-    const parsed = JSON.parse(text.replace(/```json?\n?|\n?```/g, ''));
+    const cleaned = text.replace(/```json?\n?|\n?```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
     results = parsed.map((r: any) => ({
-      name: r.name,
+      name: String(r.name),
       classified_type: FIELD_TYPES.includes(r.type) ? r.type : null,
-      confidence: Math.min(1, Math.max(0, r.confidence || 0)),
+      confidence: Math.min(1, Math.max(0, Number(r.confidence) || 0)),
     }));
   } catch {
-    return c.json({ error: 'Failed to parse classification response' }, 500);
+    return c.json({
+      error: {
+        type: 'api_error',
+        code: 'classification_failed',
+        message: 'Failed to classify form fields. The AI response was malformed. Please retry.',
+      },
+    }, 502);
   }
 
   // Cache results
@@ -116,34 +147,59 @@ Return ONLY the JSON array, no other text.`,
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (form_hash, field_name) DO UPDATE SET classified_type = $4, confidence = $5`,
         [formHash, r.name, field?.label || null, r.classified_type, r.confidence]
-      );
+      ).catch(() => {});
     }
   }
 
-  return c.json({ results, cached: false });
+  audit({
+    ...auditContext(c),
+    action: 'classify',
+    resource_type: 'field_classification',
+    user_id: c.get('userId'),
+    metadata: { form_hash: formHash, field_count: formFields.length },
+  });
+
+  return c.json({
+    object: 'classification_result',
+    results,
+    cached: false,
+    form_hash: formHash,
+    model: 'claude-haiku-4-5-20251001',
+    usage: {
+      input_tokens: response.usage.input_tokens,
+      output_tokens: response.usage.output_tokens,
+    },
+  });
 });
 
-// POST /api/fields/match — match profile fields to classified form fields
+// POST /api/fields/match
 fields.post('/match', async (c) => {
   const userId = c.get('userId');
   const body = await c.req.json();
   const parsed = matchSchema.safeParse(body);
   if (!parsed.success) {
-    return c.json({ error: 'Validation failed', details: parsed.error.flatten() }, 400);
+    return c.json({
+      error: {
+        type: 'invalid_request_error',
+        code: 'validation_error',
+        message: 'Invalid request parameters.',
+        details: parsed.error.flatten(),
+      },
+    }, 400);
   }
 
   const { profile_id, fields: formFields } = parsed.data;
 
-  // Verify ownership
   const profile = await query(
-    'SELECT id FROM profiles WHERE id = $1 AND user_id = $2',
+    'SELECT id FROM profiles WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
     [profile_id, userId]
   );
   if (profile.rows.length === 0) {
-    return c.json({ error: 'Profile not found' }, 404);
+    return c.json({
+      error: { type: 'invalid_request_error', code: 'resource_not_found', message: 'Profile not found.', param: 'profile_id' },
+    }, 404);
   }
 
-  // Get all profile fields
   const profileFields = await query(
     'SELECT field_key, value, is_sensitive FROM profile_fields WHERE profile_id = $1',
     [profile_id]
@@ -157,13 +213,24 @@ fields.post('/match', async (c) => {
       form_field: f.name,
       classified_type: f.classified_type,
       has_value: !!profileField,
-      // Don't send sensitive values in match response — client fills from local cache
       value: profileField && !profileField.is_sensitive ? profileField.value : undefined,
       is_sensitive: profileField?.is_sensitive || false,
     };
   });
 
-  return c.json({ matches });
+  const matched = matches.filter((m) => m.has_value).length;
+
+  return c.json({
+    object: 'match_result',
+    profile_id,
+    matches,
+    summary: {
+      total_fields: formFields.length,
+      matched: matched,
+      unmatched: formFields.length - matched,
+      coverage: formFields.length > 0 ? Math.round((matched / formFields.length) * 100) : 0,
+    },
+  });
 });
 
 export default fields;
